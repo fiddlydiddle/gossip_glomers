@@ -31,6 +31,7 @@ func main() {
 	seenMessages := make(map[int]bool)
 	var mutex sync.Mutex
 
+	// Receive a broadcast from client or another node
 	node.Handle("broadcast", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
 		var payload BroadcastPayload
@@ -64,13 +65,14 @@ func main() {
 		return node.Reply(msg, body)
 	})
 
+	// Respond to read requests with all messages the node has received
 	node.Handle("read", func(msg maelstrom.Message) error {
 		var body map[string]any
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		// Read the seenMessages
+		// Convert seenMessages map to slice
 		mutex.Lock()
 		values := make([]int, len(seenMessages))
 		for key := range seenMessages {
@@ -78,12 +80,13 @@ func main() {
 		}
 		mutex.Unlock()
 
+		// Build and send message
 		body["messages"] = values
 		body["type"] = "read_ok"
-
 		return node.Reply(msg, body)
 	})
 
+	// Receive the topology of the network and store it to node state
 	node.Handle("topology", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
 		var payload TopologyPayload
@@ -100,6 +103,7 @@ func main() {
 		return node.Reply(msg, body)
 	})
 
+	// Handler for receiving the entire dataset from another node
 	node.Handle("replicate", func(msg maelstrom.Message) error {
 		var payload ReplicatePayload
 		if err := json.Unmarshal(msg.Body, &payload); err != nil {
@@ -121,12 +125,15 @@ func main() {
 
 }
 
-// Every 200 milliseconds, have a node replicate all of its messages to a random neighbor
+// Every 200 milliseconds, have nodes "gossip" with a random neighbor
+// The nodes will share their whole data set with the neighbor
+// This allows nodes to keep each other up-to-date in between broadcasts (solves temporary partition issues)
 func startReplication(node *maelstrom.Node, topology map[string][]string, seenMessages map[int]bool, mutex *sync.Mutex) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// Read the neighbors from topology
 		neighbors := topology[node.ID()]
 		if len(neighbors) == 0 {
 			continue
@@ -135,6 +142,7 @@ func startReplication(node *maelstrom.Node, topology map[string][]string, seenMe
 		// Select random neighbor to which to replicate messages
 		neighbor := neighbors[rand.Intn(len(neighbors))]
 
+		// Convert seenMessages map to slice
 		mutex.Lock()
 		values := make([]int, len(seenMessages))
 		for key := range seenMessages {
@@ -142,11 +150,11 @@ func startReplication(node *maelstrom.Node, topology map[string][]string, seenMe
 		}
 		mutex.Unlock()
 
+		// Build and send message
 		replicateMessageBody := map[string]any{
 			"type":     "replicate",
 			"messages": values,
 		}
-
 		node.Send(neighbor, replicateMessageBody)
 	}
 }
