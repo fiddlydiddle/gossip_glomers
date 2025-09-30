@@ -9,9 +9,10 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type AddPayload struct {
-	Type  string `json:"type"`
-	Delta int    `json:"delta"`
+type SendPaylod struct {
+	Type string `json:"type"`
+	Key  string `json:"key"`
+	Msg  int    `json:"msg"`
 }
 
 type BroadcastCounterPayload struct {
@@ -19,20 +20,19 @@ type BroadcastCounterPayload struct {
 	Counter int    `json:"counter"`
 }
 
+type Message struct {
+	Counter int
+	Msg     int
+}
+
 func main() {
 	node := maelstrom.NewNode()
 	var mutex sync.Mutex
 	kvStore := maelstrom.NewSeqKV(node)
 
-	node.Handle("init", func(msg maelstrom.Message) error {
-		kvStore.Write(context.Background(), "gcounter", 0)
-		kvStore.Write(context.Background(), node.ID(), 0)
-		return node.Reply(msg, map[string]any{"type": "init_ok"})
-	})
-
-	node.Handle("add", func(msg maelstrom.Message) error {
+	node.Handle("send", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
-		var payload AddPayload
+		var payload SendPaylod
 		if err := json.Unmarshal(msg.Body, &payload); err != nil {
 			return err
 		}
@@ -44,14 +44,19 @@ func main() {
 				currentCounter = 0
 			}
 
-			newCounter := currentCounter + payload.Delta
-
-			storeErr := kvStore.CompareAndSwap(context.Background(), "counter", currentCounter, newCounter, true)
+			newCounter := currentCounter + 1
+			newMessage := Message{Counter: newCounter, Msg: payload.Msg}
+			storeMsgErr := kvStore.Write(context.Background(), "messages", newMessage)
+			if storeMsgErr != nil {
+				return storeMsgErr
+			}
+			storeCounterErr := kvStore.CompareAndSwap(context.Background(), "counter", currentCounter, newCounter, true)
 			mutex.Unlock()
 
-			if storeErr != nil {
-				return storeErr
+			if storeCounterErr != nil {
+				return storeCounterErr
 			} else {
+				go broadcastCounter(node, newCounter)
 				break
 			}
 		}
@@ -114,5 +119,20 @@ func main() {
 
 	if err := node.Run(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func broadcastCounter(node *maelstrom.Node, counter int) {
+	nodeIds := node.NodeIDs()
+	for _, nodeId := range nodeIds {
+		if nodeId == node.ID() {
+			continue
+		}
+		node.RPC(nodeId, BroadcastCounterPayload{
+			Type:    "broadcast",
+			Counter: counter,
+		}, func(msg maelstrom.Message) error {
+			return nil
+		})
 	}
 }
