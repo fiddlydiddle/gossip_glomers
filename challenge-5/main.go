@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -50,69 +51,57 @@ func main() {
 
 		var finalOffset int
 		var finalErr error
-		for {
-			// Fetch current offset from distributed store and increment
-			currentOffset, err := offsetKvStore.ReadInt(context.Background(), "offset")
-			if err != nil {
-				currentOffset = 0
-			}
-			newOffset := currentOffset + 1
-
-			// Fetch current messages from distributed store for key
-			var currentKeyMessages []logMessage
-			existingRawValue, messageReadErr := messageKvStore.Read(context.Background(), payload.Key)
-			if messageReadErr != nil {
-				if maelstrom.ErrorCode(messageReadErr) == maelstrom.KeyDoesNotExist {
-					// Key doesn't exist yet
-					existingRawValue = nil
-				} else {
-					return messageReadErr
-				}
+		if node.ID() != node.NodeIDs()[0] {
+			// this node is not the leader. Forward the request to the leader
+			resp, forwardErr := node.SyncRPC(context.Background(), node.NodeIDs()[0], msg.Body)
+			if forwardErr != nil {
+				return forwardErr
 			}
 
-			// Serialize the kv-store data to logMessage type
-			if existingRawValue != nil {
-				rawJSONBytes, marshalErr := json.Marshal(existingRawValue)
-				if marshalErr != nil {
-					return fmt.Errorf("failed to marshal existing log for unmarshal: %w", marshalErr)
+			return node.Reply(msg, resp.Body)
+		} else {
+			// This node is the leader. Save the message to the kvStore
+			for {
+				// Fetch current offset from distributed store and increment
+				currentOffset, err := offsetKvStore.ReadInt(context.Background(), fmt.Sprintf("%s_offset", payload.Key))
+				if err != nil {
+					currentOffset = 0
+				}
+				newOffset := currentOffset + 1
+
+				// Write new message for the key-offset pair
+				messageStoreErr := messageKvStore.Write(
+					context.Background(),
+					fmt.Sprintf("%s_%s", payload.Key, strconv.Itoa(newOffset)),
+					payload.Msg,
+				)
+				if messageStoreErr != nil {
+					return messageStoreErr
 				}
 
-				if unmarshalErr := json.Unmarshal(rawJSONBytes, &currentKeyMessages); unmarshalErr != nil {
-					return fmt.Errorf("failed to unmarshal log: %w. Raw value type: %T", unmarshalErr, existingRawValue)
-				}
-			}
-
-			// Add new message and save to distributed store
-			newMessage := logMessage{Offset: newOffset, Msg: payload.Msg}
-			newKeyMessages := append(currentKeyMessages, newMessage)
-			newRawValue := newKeyMessages
-			messageStoreErr := messageKvStore.CompareAndSwap(context.Background(),
-				payload.Key, existingRawValue, newRawValue, true)
-
-			if messageStoreErr != nil {
-				if rpcErr, ok := messageStoreErr.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
-					// Log CAS failed, retry
-					continue
-				}
-				return messageStoreErr
-			}
-
-			// Now store the new offset
-			offsetStoreErr := offsetKvStore.CompareAndSwap(context.Background(), "offset", currentOffset, newOffset, true)
-			if offsetStoreErr != nil {
-				if rpcErr, ok := offsetStoreErr.(*maelstrom.RPCError); ok {
-					if rpcErr.Error() == "precondition_failed" {
-						// CAS error, retry
-						continue
+				// Now store the new offset
+				offsetStoreErr := offsetKvStore.CompareAndSwap(
+					context.Background(),
+					"offset",
+					currentOffset,
+					newOffset,
+					true,
+				)
+				if offsetStoreErr != nil {
+					if rpcErr, ok := offsetStoreErr.(*maelstrom.RPCError); ok {
+						if rpcErr.Error() == "precondition_failed" {
+							// CAS error, retry
+							continue
+						}
 					}
+
+					finalErr = offsetStoreErr
+					break
 				}
 
-				finalErr = offsetStoreErr
+				finalOffset = newOffset
 				break
 			}
-
-			finalOffset = newOffset
-			break
 		}
 
 		if finalErr != nil {
@@ -133,27 +122,31 @@ func main() {
 
 		messages := make(map[string][][2]int)
 		for key, requestedOffset := range payload.Offsets {
-			// Fetch current messages from distributed store for key
-			var currentKeyMessages []logMessage
-			messageReadErr := messageKvStore.ReadInto(context.Background(), key, &currentKeyMessages)
-			if messageReadErr != nil {
-				if maelstrom.ErrorCode(messageReadErr) != maelstrom.KeyDoesNotExist {
-					return messageReadErr
+			// Get latest offset for key
+			offsetKey := fmt.Sprintf("%s_offset", key)
+			latestOffset, err := offsetKvStore.ReadInt(context.Background(), offsetKey)
+			if err != nil {
+				// New key
+				if maelstrom.ErrorCode(err) == maelstrom.KeyDoesNotExist {
+					latestOffset = 0
+				} else {
+					return err
 				}
 			}
 
-			var startIdx int = -1
-			for i, logMessage := range currentKeyMessages {
-				if logMessage.Offset >= requestedOffset {
-					startIdx = i
-					break
-				}
-			}
+			for offset := requestedOffset; offset <= latestOffset; offset++ {
+				messageKey := fmt.Sprintf("%s:%d", key, offset)
 
-			if startIdx != -1 {
-				for _, logMessage := range currentKeyMessages[startIdx:] {
-					messages[key] = append(messages[key], [2]int{logMessage.Offset, logMessage.Msg})
+				messageValue, readErr := messageKvStore.ReadInt(context.Background(), messageKey)
+
+				if readErr != nil {
+					if maelstrom.ErrorCode(readErr) == maelstrom.KeyDoesNotExist {
+						break
+					}
+					return readErr
 				}
+
+				messages[key] = append(messages[key], [2]int{offset, messageValue})
 			}
 		}
 
@@ -170,6 +163,7 @@ func main() {
 			return err
 		}
 
+		// Write each key/offset pair to the store
 		for key, offset := range payload.Offsets {
 			currentCommitted, err := commitedOffsetKvStore.ReadInt(context.Background(), key)
 			if err != nil {
@@ -189,6 +183,7 @@ func main() {
 			return err
 		}
 
+		// Read committed offset for each requested key
 		result := make(map[string]int)
 		for _, key := range payload.Keys {
 			currentCommitted, err := commitedOffsetKvStore.ReadInt(context.Background(), key)
