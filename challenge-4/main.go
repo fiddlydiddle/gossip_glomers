@@ -79,39 +79,6 @@ func main() {
 		return node.Reply(msg, body)
 	})
 
-	node.Handle("broadcast", func(msg maelstrom.Message) error {
-		body := make(map[string]any)
-		var payload BroadcastCounterPayload
-		if err := json.Unmarshal(msg.Body, &payload); err != nil {
-			return err
-		}
-
-		for {
-			mutex.Lock()
-			currentCounter, err := kvStore.ReadInt(context.Background(), "counter")
-			if err != nil {
-				currentCounter = 0
-			}
-
-			if payload.Counter <= currentCounter {
-				mutex.Unlock()
-				break
-			}
-
-			storeErr := kvStore.CompareAndSwap(context.Background(), "counter", currentCounter, payload.Counter, true)
-			mutex.Unlock()
-
-			if storeErr != nil {
-				return storeErr
-			} else {
-				break
-			}
-		}
-
-		body["type"] = "broadcast_ok"
-		return node.Reply(msg, body)
-	})
-
 	if err := node.Run(); err != nil {
 		log.Fatal(err)
 	}

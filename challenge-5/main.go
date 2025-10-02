@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -15,20 +15,31 @@ type SendPaylod struct {
 	Msg  int    `json:"msg"`
 }
 
-type BroadcastCounterPayload struct {
-	Type    string `json:"type"`
-	Counter int    `json:"counter"`
+type PollPaylod struct {
+	Type    string         `json:"type"`
+	Offsets map[string]int `json:"offsets"`
 }
 
-type Message struct {
-	Counter int
-	Msg     int
+type CommitPayload struct {
+	Type    string         `json:"type"`
+	Offsets map[string]int `json:"offsets"`
+}
+
+type ListCommitsPayload struct {
+	Type string   `json:"type"`
+	Keys []string `json:"keys"`
+}
+
+type logMessage struct {
+	Offset int
+	Msg    int
 }
 
 func main() {
 	node := maelstrom.NewNode()
-	var mutex sync.Mutex
-	kvStore := maelstrom.NewSeqKV(node)
+	offsetKvStore := maelstrom.NewLinKV(node)
+	messageKvStore := maelstrom.NewLinKV(node)
+	commitedOffsetKvStore := maelstrom.NewLinKV(node)
 
 	node.Handle("send", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
@@ -37,102 +48,162 @@ func main() {
 			return err
 		}
 
+		var finalOffset int
+		var finalErr error
 		for {
-			mutex.Lock()
-			currentCounter, err := kvStore.ReadInt(context.Background(), "counter")
+			// Fetch current offset from distributed store and increment
+			currentOffset, err := offsetKvStore.ReadInt(context.Background(), "offset")
 			if err != nil {
-				currentCounter = 0
+				currentOffset = 0
+			}
+			newOffset := currentOffset + 1
+
+			// Fetch current messages from distributed store for key
+			var currentKeyMessages []logMessage
+			existingRawValue, messageReadErr := messageKvStore.Read(context.Background(), payload.Key)
+			if messageReadErr != nil {
+				if maelstrom.ErrorCode(messageReadErr) == maelstrom.KeyDoesNotExist {
+					// Key doesn't exist yet
+					existingRawValue = nil
+				} else {
+					return messageReadErr
+				}
 			}
 
-			newCounter := currentCounter + 1
-			newMessage := Message{Counter: newCounter, Msg: payload.Msg}
-			storeMsgErr := kvStore.Write(context.Background(), "messages", newMessage)
-			if storeMsgErr != nil {
-				return storeMsgErr
-			}
-			storeCounterErr := kvStore.CompareAndSwap(context.Background(), "counter", currentCounter, newCounter, true)
-			mutex.Unlock()
+			// Serialize the kv-store data to logMessage type
+			if existingRawValue != nil {
+				rawJSONBytes, marshalErr := json.Marshal(existingRawValue)
+				if marshalErr != nil {
+					return fmt.Errorf("failed to marshal existing log for unmarshal: %w", marshalErr)
+				}
 
-			if storeCounterErr != nil {
-				return storeCounterErr
-			} else {
-				go broadcastCounter(node, newCounter)
+				if unmarshalErr := json.Unmarshal(rawJSONBytes, &currentKeyMessages); unmarshalErr != nil {
+					return fmt.Errorf("failed to unmarshal log: %w. Raw value type: %T", unmarshalErr, existingRawValue)
+				}
+			}
+
+			// Add new message and save to distributed store
+			newMessage := logMessage{Offset: newOffset, Msg: payload.Msg}
+			newKeyMessages := append(currentKeyMessages, newMessage)
+			newRawValue := newKeyMessages
+			messageStoreErr := messageKvStore.CompareAndSwap(context.Background(),
+				payload.Key, existingRawValue, newRawValue, true)
+
+			if messageStoreErr != nil {
+				if rpcErr, ok := messageStoreErr.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
+					// Log CAS failed, retry
+					continue
+				}
+				return messageStoreErr
+			}
+
+			// Now store the new offset
+			offsetStoreErr := offsetKvStore.CompareAndSwap(context.Background(), "offset", currentOffset, newOffset, true)
+			if offsetStoreErr != nil {
+				if rpcErr, ok := offsetStoreErr.(*maelstrom.RPCError); ok {
+					if rpcErr.Error() == "precondition_failed" {
+						// CAS error, retry
+						continue
+					}
+				}
+
+				finalErr = offsetStoreErr
 				break
 			}
+
+			finalOffset = newOffset
+			break
 		}
 
-		body["type"] = "add_ok"
+		if finalErr != nil {
+			return finalErr
+		}
+
+		body["type"] = "send_ok"
+		body["offset"] = finalOffset
 		return node.Reply(msg, body)
 	})
 
-	node.Handle("read", func(msg maelstrom.Message) error {
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		mutex.Lock()
-		counter, err := kvStore.ReadInt(context.Background(), "counter")
-		if err != nil {
-			counter = 0
-		}
-		mutex.Unlock()
-
-		body["value"] = counter
-		body["type"] = "read_ok"
-
-		return node.Reply(msg, body)
-	})
-
-	node.Handle("broadcast", func(msg maelstrom.Message) error {
+	node.Handle("poll", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
-		var payload BroadcastCounterPayload
+		var payload PollPaylod
 		if err := json.Unmarshal(msg.Body, &payload); err != nil {
 			return err
 		}
 
-		for {
-			mutex.Lock()
-			currentCounter, err := kvStore.ReadInt(context.Background(), "counter")
-			if err != nil {
-				currentCounter = 0
+		messages := make(map[string][][2]int)
+		for key, requestedOffset := range payload.Offsets {
+			// Fetch current messages from distributed store for key
+			var currentKeyMessages []logMessage
+			messageReadErr := messageKvStore.ReadInto(context.Background(), key, &currentKeyMessages)
+			if messageReadErr != nil {
+				if maelstrom.ErrorCode(messageReadErr) != maelstrom.KeyDoesNotExist {
+					return messageReadErr
+				}
 			}
 
-			if payload.Counter <= currentCounter {
-				mutex.Unlock()
-				break
+			var startIdx int = -1
+			for i, logMessage := range currentKeyMessages {
+				if logMessage.Offset >= requestedOffset {
+					startIdx = i
+					break
+				}
 			}
 
-			storeErr := kvStore.CompareAndSwap(context.Background(), "counter", currentCounter, payload.Counter, true)
-			mutex.Unlock()
-
-			if storeErr != nil {
-				return storeErr
-			} else {
-				break
+			if startIdx != -1 {
+				for _, logMessage := range currentKeyMessages[startIdx:] {
+					messages[key] = append(messages[key], [2]int{logMessage.Offset, logMessage.Msg})
+				}
 			}
 		}
 
-		body["type"] = "broadcast_ok"
+		body["msgs"] = messages
+		body["type"] = "poll_ok"
+
+		return node.Reply(msg, body)
+	})
+
+	node.Handle("commit_offsets", func(msg maelstrom.Message) error {
+		body := make(map[string]any)
+		var payload CommitPayload
+		if err := json.Unmarshal(msg.Body, &payload); err != nil {
+			return err
+		}
+
+		for key, offset := range payload.Offsets {
+			currentCommitted, err := commitedOffsetKvStore.ReadInt(context.Background(), key)
+			if err != nil {
+				currentCommitted = 0
+			}
+			_ = commitedOffsetKvStore.CompareAndSwap(context.Background(), key, currentCommitted, offset, true)
+		}
+
+		body["type"] = "commit_offsets_ok"
+		return node.Reply(msg, body)
+	})
+
+	node.Handle("list_committed_offsets", func(msg maelstrom.Message) error {
+		body := make(map[string]any)
+		var payload ListCommitsPayload
+		if err := json.Unmarshal(msg.Body, &payload); err != nil {
+			return err
+		}
+
+		result := make(map[string]int)
+		for _, key := range payload.Keys {
+			currentCommitted, err := commitedOffsetKvStore.ReadInt(context.Background(), key)
+			if err != nil {
+				currentCommitted = 0
+			}
+			result[key] = currentCommitted
+		}
+
+		body["type"] = "list_committed_offsets_ok"
+		body["offsets"] = result
 		return node.Reply(msg, body)
 	})
 
 	if err := node.Run(); err != nil {
 		log.Fatal(err)
-	}
-}
-
-func broadcastCounter(node *maelstrom.Node, counter int) {
-	nodeIds := node.NodeIDs()
-	for _, nodeId := range nodeIds {
-		if nodeId == node.ID() {
-			continue
-		}
-		node.RPC(nodeId, BroadcastCounterPayload{
-			Type:    "broadcast",
-			Counter: counter,
-		}, func(msg maelstrom.Message) error {
-			return nil
-		})
 	}
 }
