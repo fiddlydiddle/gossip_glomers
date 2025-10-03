@@ -50,6 +50,9 @@ func main() {
 
 		var finalOffset int
 		var finalErr error
+
+		mu.Lock()
+		defer mu.Unlock()
 		for {
 
 			// Fetch current offset from distributed store and increment
@@ -89,7 +92,6 @@ func main() {
 			newKeyMessages := append(currentKeyMessages, newMessage)
 			newRawValue := newKeyMessages
 
-			mu.Lock()
 			messageStoreErr := kvStore.CompareAndSwap(
 				context.Background(),
 				payload.Key,
@@ -103,7 +105,7 @@ func main() {
 					// Log CAS failed, retry
 					continue
 				}
-				return messageStoreErr
+				break
 			}
 
 			// store the new offset
@@ -125,7 +127,6 @@ func main() {
 				finalErr = offsetStoreErr
 				break
 			}
-			mu.Unlock()
 
 			finalOffset = newOffset
 			break
