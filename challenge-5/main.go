@@ -106,6 +106,11 @@ func (server *Server) hashKeyToNodeIndex(key string) int {
 // End server struct and helper methods
 /////////////////////////////////////////////////////
 
+type TopicState struct {
+	Offset  int    `json:"offset"`
+	LogData string `json:"log_data"`
+}
+
 func main() {
 	node := maelstrom.NewNode()
 	kvStore := maelstrom.NewLinKV(node)
@@ -142,68 +147,63 @@ func main() {
 		topicMutex.Lock()
 		defer topicMutex.Unlock()
 		for {
-			// Fetch current offset from distributed store and increment
-			offsetKey := payload.Key + "_offset"
-			currentOffset, err := kvStore.ReadInt(context.Background(), offsetKey)
-			if err != nil {
-				currentOffset = 0
-			}
-			newOffset := currentOffset + 1
-
-			// Fetch current messages from distributed store for key
-			var logMessages LogMessages
-			existingRawValue, messageReadErr := kvStore.Read(context.Background(), payload.Key)
-			if messageReadErr != nil {
-				if maelstrom.ErrorCode(messageReadErr) == maelstrom.KeyDoesNotExist {
-					// Key doesn't exist yet
-					existingRawValue = nil
+			// Read current offset and messages from kvStore
+			var currentTopicState TopicState
+			existingRawValue, readErr := kvStore.Read(context.Background(), payload.Key)
+			if readErr != nil {
+				if maelstrom.ErrorCode(readErr) == maelstrom.KeyDoesNotExist {
+					// Topic doesn't exist yet, initialize it
+					currentTopicState = TopicState{Offset: 0, LogData: ""}
 				} else {
-					return messageReadErr
+					return readErr
+				}
+			} else {
+				// Serialize read data to TopicState
+				switch val := existingRawValue.(type) {
+				case string:
+					// If it's a string (or JSON), unmarshal it directly
+					if unmarshalErr := json.Unmarshal([]byte(val), &currentTopicState); unmarshalErr != nil {
+						return fmt.Errorf("failed to unmarshal TopicState from string: %w", unmarshalErr)
+					}
+				case map[string]any:
+					rawJSONBytes, marshalErr := json.Marshal(val)
+					if marshalErr != nil {
+						return fmt.Errorf("failed to re-marshal map: %w", marshalErr)
+					}
+					if unmarshalErr := json.Unmarshal(rawJSONBytes, &currentTopicState); unmarshalErr != nil {
+						return fmt.Errorf("failed to unmarshal TopicState from map: %w", unmarshalErr)
+					}
+				default:
+					return fmt.Errorf("unexpected type %T returned from kvStore.Read", val)
 				}
 			}
+			newOffset := currentTopicState.Offset + 1
 
-			if existingRawValue != nil {
-				logMessages, err = serializeToLogMessages(existingRawValue.(string))
-				if err != nil {
-					return err
-				}
+			newMessage := fmt.Sprintf("%d:%d", newOffset, payload.Msg)
+
+			if currentTopicState.LogData == "" {
+				currentTopicState.LogData = newMessage
+			} else {
+				currentTopicState.LogData = currentTopicState.LogData + "," + newMessage
+			}
+			currentTopicState.Offset = newOffset
+
+			newRawValue, marshalErr := json.Marshal(currentTopicState)
+			if marshalErr != nil {
+				return marshalErr
 			}
 
-			// Add new message and save to distributed store
-			logMessages.append(LogMessage{
-				Offset: newOffset,
-				Msg:    payload.Msg,
-			})
-			newRawValue := logMessages.toString()
 			messageStoreErr := kvStore.Write(
 				context.Background(),
 				payload.Key,
-				newRawValue,
+				string(newRawValue),
 			)
-
 			if messageStoreErr != nil {
 				if rpcErr, ok := messageStoreErr.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
 					// Log CAS failed, retry
 					continue
 				}
-				break
-			}
-
-			// store the new offset
-			offsetStoreErr := kvStore.Write(
-				context.Background(),
-				offsetKey,
-				newOffset,
-			)
-			if offsetStoreErr != nil {
-				if rpcErr, ok := offsetStoreErr.(*maelstrom.RPCError); ok {
-					if rpcErr.Error() == "precondition_failed" {
-						// CAS error, retry
-						continue
-					}
-				}
-
-				finalErr = offsetStoreErr
+				finalErr = messageStoreErr
 				break
 			}
 
@@ -230,7 +230,7 @@ func main() {
 		messages := make(map[string][][2]int)
 		for key, requestedOffset := range payload.Offsets {
 			// Fetch current messages from distributed store for key
-			var logMessages LogMessages
+			var currentTopicState TopicState
 			existingRawValue, messageReadErr := kvStore.Read(context.Background(), key)
 			if messageReadErr != nil {
 				if maelstrom.ErrorCode(messageReadErr) == maelstrom.KeyDoesNotExist {
@@ -241,8 +241,24 @@ func main() {
 				}
 			}
 
+			// Serialize data to TopicState
 			if existingRawValue != nil {
-				logMessages, messageReadErr = serializeToLogMessages(existingRawValue.(string))
+				switch val := existingRawValue.(type) {
+				case string:
+					json.Unmarshal([]byte(val), &currentTopicState)
+				case map[string]any:
+					if logData, ok := val["log_data"].(string); ok {
+						currentTopicState.LogData = logData
+					} else {
+						return fmt.Errorf("poll: missing or invalid log_data in map")
+					}
+				}
+			}
+
+			// Serialize messages
+			var logMessages LogMessages
+			if currentTopicState.LogData != "" {
+				logMessages, messageReadErr = serializeToLogMessages(currentTopicState.LogData)
 				if messageReadErr != nil {
 					return messageReadErr
 				}
