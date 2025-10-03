@@ -46,7 +46,7 @@ func (logMessage LogMessage) toString() string {
 }
 
 ////////////////////////////////////////////////
-// /LogMessage struct and toString() method
+// End LogMessage struct and toString() method
 ////////////////////////////////////////////////
 
 // /////////////////////////////////////////////////
@@ -69,13 +69,43 @@ func (logMessages *LogMessages) append(logMessage LogMessage) {
 }
 
 ///////////////////////////////////////////////////
-// /LogMessages slice wrapper stuct and methods
+// End LogMessages slice wrapper stuct and methods
 //////////////////////////////////////////////////
+
+// ///////////////////////////////////////////////////
+// server struct and helper methods
+// ///////////////////////////////////////////////////
+type Server struct {
+	node       *maelstrom.Node
+	kvStore    *maelstrom.KV
+	topicLocks map[string]*sync.Mutex
+	lockMapMu  sync.Mutex
+}
+
+func (server *Server) getTopicLock(key string) *sync.Mutex {
+	server.lockMapMu.Lock()
+	defer server.lockMapMu.Unlock()
+
+	mu, ok := server.topicLocks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		server.topicLocks[key] = mu
+	}
+	return mu
+}
+
+/////////////////////////////////////////////////////
+// End server struct and helper methods
+/////////////////////////////////////////////////////
 
 func main() {
 	node := maelstrom.NewNode()
 	kvStore := maelstrom.NewLinKV(node)
-	var mu sync.Mutex
+	server := &Server{
+		node:       node,
+		kvStore:    kvStore,
+		topicLocks: make(map[string]*sync.Mutex),
+	}
 
 	node.Handle("send", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
@@ -87,8 +117,9 @@ func main() {
 		var finalOffset int
 		var finalErr error
 
-		mu.Lock()
-		defer mu.Unlock()
+		topicMutex := server.getTopicLock(payload.Key)
+		topicMutex.Lock()
+		defer topicMutex.Unlock()
 		for {
 			// Fetch current offset from distributed store and increment
 			offsetKey := payload.Key + "_offset"
