@@ -37,9 +37,7 @@ type logMessage struct {
 
 func main() {
 	node := maelstrom.NewNode()
-	offsetKvStore := maelstrom.NewLinKV(node)
-	messageKvStore := maelstrom.NewLinKV(node)
-	commitedOffsetKvStore := maelstrom.NewLinKV(node)
+	kvStore := maelstrom.NewLinKV(node)
 
 	node.Handle("send", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
@@ -52,7 +50,8 @@ func main() {
 		var finalErr error
 		for {
 			// Fetch current offset from distributed store and increment
-			currentOffset, err := offsetKvStore.ReadInt(context.Background(), "offset")
+			offsetKey := payload.Key + "_offset"
+			currentOffset, err := kvStore.ReadInt(context.Background(), offsetKey)
 			if err != nil {
 				currentOffset = 0
 			}
@@ -60,7 +59,7 @@ func main() {
 
 			// Fetch current messages from distributed store for key
 			var currentKeyMessages []logMessage
-			existingRawValue, messageReadErr := messageKvStore.Read(context.Background(), payload.Key)
+			existingRawValue, messageReadErr := kvStore.Read(context.Background(), payload.Key)
 			if messageReadErr != nil {
 				if maelstrom.ErrorCode(messageReadErr) == maelstrom.KeyDoesNotExist {
 					// Key doesn't exist yet
@@ -86,7 +85,7 @@ func main() {
 			newMessage := logMessage{Offset: newOffset, Msg: payload.Msg}
 			newKeyMessages := append(currentKeyMessages, newMessage)
 			newRawValue := newKeyMessages
-			messageStoreErr := messageKvStore.CompareAndSwap(context.Background(),
+			messageStoreErr := kvStore.CompareAndSwap(context.Background(),
 				payload.Key, existingRawValue, newRawValue, true)
 
 			if messageStoreErr != nil {
@@ -97,8 +96,8 @@ func main() {
 				return messageStoreErr
 			}
 
-			// Now store the new offset
-			offsetStoreErr := offsetKvStore.CompareAndSwap(context.Background(), "offset", currentOffset, newOffset, true)
+			// store the new offset
+			offsetStoreErr := kvStore.CompareAndSwap(context.Background(), offsetKey, currentOffset, newOffset, true)
 			if offsetStoreErr != nil {
 				if rpcErr, ok := offsetStoreErr.(*maelstrom.RPCError); ok {
 					if rpcErr.Error() == "precondition_failed" {
@@ -135,7 +134,7 @@ func main() {
 		for key, requestedOffset := range payload.Offsets {
 			// Fetch current messages from distributed store for key
 			var currentKeyMessages []logMessage
-			messageReadErr := messageKvStore.ReadInto(context.Background(), key, &currentKeyMessages)
+			messageReadErr := kvStore.ReadInto(context.Background(), key, &currentKeyMessages)
 			if messageReadErr != nil {
 				if maelstrom.ErrorCode(messageReadErr) != maelstrom.KeyDoesNotExist {
 					return messageReadErr
@@ -171,11 +170,11 @@ func main() {
 		}
 
 		for key, offset := range payload.Offsets {
-			currentCommitted, err := commitedOffsetKvStore.ReadInt(context.Background(), key)
+			currentCommitted, err := kvStore.ReadInt(context.Background(), key)
 			if err != nil {
 				currentCommitted = 0
 			}
-			_ = commitedOffsetKvStore.CompareAndSwap(context.Background(), key, currentCommitted, offset, true)
+			_ = kvStore.CompareAndSwap(context.Background(), key, currentCommitted, offset, true)
 		}
 
 		body["type"] = "commit_offsets_ok"
@@ -191,7 +190,7 @@ func main() {
 
 		result := make(map[string]int)
 		for _, key := range payload.Keys {
-			currentCommitted, err := commitedOffsetKvStore.ReadInt(context.Background(), key)
+			currentCommitted, err := kvStore.ReadInt(context.Background(), key)
 			if err != nil {
 				currentCommitted = 0
 			}
