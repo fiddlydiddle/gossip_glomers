@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -31,10 +33,44 @@ type ListCommitsPayload struct {
 	Keys []string `json:"keys"`
 }
 
-type logMessage struct {
+// //////////////////////////////////////////////
+// LogMessage struct and toString() method
+// //////////////////////////////////////////////
+type LogMessage struct {
 	Offset int
 	Msg    int
 }
+
+func (logMessage LogMessage) toString() string {
+	return fmt.Sprintf("%d:%d", logMessage.Offset, logMessage.Msg)
+}
+
+////////////////////////////////////////////////
+// /LogMessage struct and toString() method
+////////////////////////////////////////////////
+
+// /////////////////////////////////////////////////
+// LogMessages slice wrapper stuct and methods
+// ////////////////////////////////////////////////
+type LogMessages struct {
+	messages []LogMessage
+}
+
+func (logMessages LogMessages) toString() string {
+	result := make([]string, len(logMessages.messages))
+	for i := 0; i < len(logMessages.messages); i++ {
+		result[i] = logMessages.messages[i].toString()
+	}
+	return strings.Join(result, ",")
+}
+
+func (logMessages *LogMessages) append(logMessage LogMessage) {
+	logMessages.messages = append(logMessages.messages, logMessage)
+}
+
+///////////////////////////////////////////////////
+// /LogMessages slice wrapper stuct and methods
+//////////////////////////////////////////////////
 
 func main() {
 	node := maelstrom.NewNode()
@@ -63,7 +99,7 @@ func main() {
 			newOffset := currentOffset + 1
 
 			// Fetch current messages from distributed store for key
-			var currentKeyMessages []logMessage
+			var logMessages LogMessages
 			existingRawValue, messageReadErr := kvStore.Read(context.Background(), payload.Key)
 			if messageReadErr != nil {
 				if maelstrom.ErrorCode(messageReadErr) == maelstrom.KeyDoesNotExist {
@@ -74,23 +110,19 @@ func main() {
 				}
 			}
 
-			// Serialize the kv-store data to logMessage type
 			if existingRawValue != nil {
-				rawJSONBytes, marshalErr := json.Marshal(existingRawValue)
-				if marshalErr != nil {
-					return fmt.Errorf("failed to marshal existing log for unmarshal: %w", marshalErr)
-				}
-
-				if unmarshalErr := json.Unmarshal(rawJSONBytes, &currentKeyMessages); unmarshalErr != nil {
-					return fmt.Errorf("failed to unmarshal log: %w. Raw value type: %T", unmarshalErr, existingRawValue)
+				logMessages, err = serializeToLogMessages(existingRawValue.(string))
+				if err != nil {
+					return err
 				}
 			}
 
 			// Add new message and save to distributed store
-			newMessage := logMessage{Offset: newOffset, Msg: payload.Msg}
-			newKeyMessages := append(currentKeyMessages, newMessage)
-			newRawValue := newKeyMessages
-
+			logMessages.append(LogMessage{
+				Offset: newOffset,
+				Msg:    payload.Msg,
+			})
+			newRawValue := logMessages.toString()
 			messageStoreErr := kvStore.Write(
 				context.Background(),
 				payload.Key,
@@ -146,24 +178,28 @@ func main() {
 		messages := make(map[string][][2]int)
 		for key, requestedOffset := range payload.Offsets {
 			// Fetch current messages from distributed store for key
-			var currentKeyMessages []logMessage
-			messageReadErr := kvStore.ReadInto(context.Background(), key, &currentKeyMessages)
+			var logMessages LogMessages
+			existingRawValue, messageReadErr := kvStore.Read(context.Background(), key)
 			if messageReadErr != nil {
-				if maelstrom.ErrorCode(messageReadErr) != maelstrom.KeyDoesNotExist {
+				if maelstrom.ErrorCode(messageReadErr) == maelstrom.KeyDoesNotExist {
+					// Key doesn't exist yet
+					existingRawValue = nil
+				} else {
 					return messageReadErr
 				}
 			}
 
-			var startIdx int = -1
-			for i, logMessage := range currentKeyMessages {
-				if logMessage.Offset >= requestedOffset {
-					startIdx = i
-					break
+			if existingRawValue != nil {
+				logMessages, messageReadErr = serializeToLogMessages(existingRawValue.(string))
+				if messageReadErr != nil {
+					return messageReadErr
 				}
 			}
 
+			var startIdx int = findOffset(logMessages, requestedOffset)
+
 			if startIdx != -1 {
-				for _, logMessage := range currentKeyMessages[startIdx:] {
+				for _, logMessage := range logMessages.messages[startIdx:] {
 					messages[key] = append(messages[key], [2]int{logMessage.Offset, logMessage.Msg})
 				}
 			}
@@ -218,4 +254,67 @@ func main() {
 	if err := node.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func findOffset(logMessages LogMessages, startingOffset int) int {
+	left := 0
+	right := len(logMessages.messages) - 1
+
+	if len(logMessages.messages) == 0 || startingOffset <= logMessages.messages[0].Offset {
+		return 0
+	}
+
+	// Optimization: If the requested offset is past the last log entry, return the length
+	if startingOffset > logMessages.messages[right].Offset {
+		return len(logMessages.messages)
+	}
+
+	// Binary search logic
+	for left <= right {
+		mid := left + (right-left)/2
+		midOffset := logMessages.messages[mid].Offset
+
+		if midOffset == startingOffset {
+			return mid
+		}
+
+		if midOffset < startingOffset {
+			left = mid + 1
+		} else {
+			right = mid - 1
+		}
+	}
+
+	return left
+}
+
+// serializeToLogMessages(s string) ([]logMessage, error)
+// Parses the stored comma-separated string back into a slice of logMessage structs.
+func serializeToLogMessages(str string) (LogMessages, error) {
+	if str == "" {
+		return LogMessages{messages: nil}, nil
+	}
+
+	split := strings.Split(str, ",")
+	messages := make([]LogMessage, 0, len(split))
+	for _, val := range split {
+		idx := strings.Index(val, ":")
+		if idx == -1 {
+			continue // Skip malformed entry
+		}
+
+		offset, err := strconv.Atoi(val[:idx])
+		if err != nil {
+			return LogMessages{messages: nil}, fmt.Errorf("failed to parse offset: %w", err)
+		}
+		message, err := strconv.Atoi(val[idx+1:])
+		if err != nil {
+			return LogMessages{messages: nil}, fmt.Errorf("failed to parse message: %w", err)
+		}
+		messages = append(messages, LogMessage{
+			Offset: offset,
+			Msg:    message,
+		})
+	}
+	return LogMessages{messages: messages}, nil
 }
