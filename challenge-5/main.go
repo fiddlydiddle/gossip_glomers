@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"strconv"
 	"strings"
@@ -94,6 +95,13 @@ func (server *Server) getTopicLock(key string) *sync.Mutex {
 	return mu
 }
 
+func (server *Server) hashKeyToNodeIndex(key string) int {
+	hashVal := fnv.New32a()
+	hashVal.Write([]byte(key))
+	// Hash by length of number of nodes
+	return int(hashVal.Sum32() % uint32(len(server.node.NodeIDs())))
+}
+
 /////////////////////////////////////////////////////
 // End server struct and helper methods
 /////////////////////////////////////////////////////
@@ -114,6 +122,19 @@ func main() {
 			return err
 		}
 
+		keyLeaderId := server.node.NodeIDs()[server.hashKeyToNodeIndex(payload.Key)]
+
+		if keyLeaderId != server.node.ID() {
+			// This node is not the leader for this key
+			// Forward request to the leader
+			_, forwardErr := server.node.SyncRPC(context.Background(), keyLeaderId, msg.Body)
+			if forwardErr != nil {
+				return forwardErr
+			}
+			return server.node.Reply(msg, map[string]any{"type": "send_ok", "offset": -1})
+		}
+
+		// If we got here, this node is leader for this key. Perform write.
 		var finalOffset int
 		var finalErr error
 
