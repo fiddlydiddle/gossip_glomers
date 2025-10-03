@@ -54,7 +54,6 @@ func main() {
 		mu.Lock()
 		defer mu.Unlock()
 		for {
-
 			// Fetch current offset from distributed store and increment
 			offsetKey := payload.Key + "_offset"
 			currentOffset, err := kvStore.ReadInt(context.Background(), offsetKey)
@@ -92,12 +91,10 @@ func main() {
 			newKeyMessages := append(currentKeyMessages, newMessage)
 			newRawValue := newKeyMessages
 
-			messageStoreErr := kvStore.CompareAndSwap(
+			messageStoreErr := kvStore.Write(
 				context.Background(),
 				payload.Key,
-				existingRawValue,
 				newRawValue,
-				true,
 			)
 
 			if messageStoreErr != nil {
@@ -109,12 +106,10 @@ func main() {
 			}
 
 			// store the new offset
-			offsetStoreErr := kvStore.CompareAndSwap(
+			offsetStoreErr := kvStore.Write(
 				context.Background(),
 				offsetKey,
-				currentOffset,
 				newOffset,
-				true,
 			)
 			if offsetStoreErr != nil {
 				if rpcErr, ok := offsetStoreErr.(*maelstrom.RPCError); ok {
