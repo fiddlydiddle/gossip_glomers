@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -38,6 +39,7 @@ type logMessage struct {
 func main() {
 	node := maelstrom.NewNode()
 	kvStore := maelstrom.NewLinKV(node)
+	var mu sync.Mutex
 
 	node.Handle("send", func(msg maelstrom.Message) error {
 		body := make(map[string]any)
@@ -49,6 +51,7 @@ func main() {
 		var finalOffset int
 		var finalErr error
 		for {
+
 			// Fetch current offset from distributed store and increment
 			offsetKey := payload.Key + "_offset"
 			currentOffset, err := kvStore.ReadInt(context.Background(), offsetKey)
@@ -85,8 +88,15 @@ func main() {
 			newMessage := logMessage{Offset: newOffset, Msg: payload.Msg}
 			newKeyMessages := append(currentKeyMessages, newMessage)
 			newRawValue := newKeyMessages
-			messageStoreErr := kvStore.CompareAndSwap(context.Background(),
-				payload.Key, existingRawValue, newRawValue, true)
+
+			mu.Lock()
+			messageStoreErr := kvStore.CompareAndSwap(
+				context.Background(),
+				payload.Key,
+				existingRawValue,
+				newRawValue,
+				true,
+			)
 
 			if messageStoreErr != nil {
 				if rpcErr, ok := messageStoreErr.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
@@ -97,7 +107,13 @@ func main() {
 			}
 
 			// store the new offset
-			offsetStoreErr := kvStore.CompareAndSwap(context.Background(), offsetKey, currentOffset, newOffset, true)
+			offsetStoreErr := kvStore.CompareAndSwap(
+				context.Background(),
+				offsetKey,
+				currentOffset,
+				newOffset,
+				true,
+			)
 			if offsetStoreErr != nil {
 				if rpcErr, ok := offsetStoreErr.(*maelstrom.RPCError); ok {
 					if rpcErr.Error() == "precondition_failed" {
@@ -109,6 +125,7 @@ func main() {
 				finalErr = offsetStoreErr
 				break
 			}
+			mu.Unlock()
 
 			finalOffset = newOffset
 			break
