@@ -42,10 +42,6 @@ type LogMessage struct {
 	Msg    int
 }
 
-func (logMessage LogMessage) toString() string {
-	return fmt.Sprintf("%d:%d", logMessage.Offset, logMessage.Msg)
-}
-
 ////////////////////////////////////////////////
 // End LogMessage struct and toString() method
 ////////////////////////////////////////////////
@@ -55,18 +51,6 @@ func (logMessage LogMessage) toString() string {
 // ////////////////////////////////////////////////
 type LogMessages struct {
 	messages []LogMessage
-}
-
-func (logMessages LogMessages) toString() string {
-	result := make([]string, len(logMessages.messages))
-	for i := 0; i < len(logMessages.messages); i++ {
-		result[i] = logMessages.messages[i].toString()
-	}
-	return strings.Join(result, ",")
-}
-
-func (logMessages *LogMessages) append(logMessage LogMessage) {
-	logMessages.messages = append(logMessages.messages, logMessage)
 }
 
 ///////////////////////////////////////////////////
