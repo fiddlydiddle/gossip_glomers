@@ -40,7 +40,6 @@ func main() {
 			action := parseAction(rawAction)
 			key := strconv.Itoa(action.Key)
 
-			// Read existing value (needed for both read and writes)
 			existingValue, readErr := kvStore.Read(context.Background(), strconv.Itoa(action.Key))
 			existingValues[key] = existingValue
 
@@ -59,10 +58,7 @@ func main() {
 		for _, action := range payload.Actions {
 			if action.Type == "w" {
 				key := strconv.Itoa(action.Key)
-
 				existingValue := existingValues[key]
-
-				// The 'to' value is the new value from the request.
 				storeErr := kvStore.CompareAndSwap(
 					context.Background(),
 					key,
