@@ -37,15 +37,20 @@ func main() {
 			return err
 		}
 
+		// G-counter update operation may not be successful initially
+		// Wrap in retry loop
 		for {
 			mutex.Lock()
+			// Read current counter
 			currentCounter, err := kvStore.ReadInt(context.Background(), "counter")
 			if err != nil {
 				currentCounter = 0
 			}
 
+			// Add delta
 			newCounter := currentCounter + payload.Delta
 
+			// Store new counter
 			storeErr := kvStore.CompareAndSwap(context.Background(), "counter", currentCounter, newCounter, true)
 			mutex.Unlock()
 
@@ -66,6 +71,7 @@ func main() {
 			return err
 		}
 
+		// read counter
 		mutex.Lock()
 		counter, err := kvStore.ReadInt(context.Background(), "counter")
 		if err != nil {
